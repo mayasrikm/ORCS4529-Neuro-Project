@@ -125,11 +125,11 @@ class AverageDirectionTest(ngym.TrialEnv):
         # Similar to gym envs, define observations_space and action_space
         # Optional annotation of the observation space
         self.observation_space = ngym.spaces.Box(
-            -np.inf, np.inf, shape=(K), dtype=np.float32, name=name)
+            -np.inf, np.inf, shape=(K,), dtype=np.float32)
         
         # Optional annotation of the action space
         name = {'choice': self.choices}
-        self.action_space = ngym.spaces.Discrete(2, name=name)
+        self.action_space = ngym.spaces.Discrete(2)
 
         self.total_steps = 0
         self.max_step = max_step
@@ -156,30 +156,28 @@ class AverageDirectionTest(ngym.TrialEnv):
         self.total_steps = 0
         
         # Setting trial information
-        speed_obs = np.random.rand(self.K)
-        ground_truth = np.sum(speed_obs >= 0)[1] > self.K/2 
+        speed_obs = np.random.rand(self.K) - 0.5
+        ground_truth = np.sum(speed_obs >= 0) > self.K/2 
 
         space_obs = np.copy(speed_obs)
-        for i in range(space_obs):
-            space_obs[i] += np.random.normal
+        for i in range(len(space_obs)):
+            space_obs[i] += np.random.normal()
 
         trial = {'ground_truth': ground_truth,
                     'speed' : speed_obs,
                     'place' : space_obs}
         trial.update(kwargs)  # allows wrappers to modify the trial
 
-        # Adding periods sequentially
-        self.add_period(['fixation', 'delay', 'decision'])
-
         # Setting observations, default all 0
         # Setting fixation cue to 1 before decision period
-        self.add_ob(space_obs, where='fixation')
+        self.add_ob(space_obs)
 
         # Setting ground-truth value for supervised learning
-        self.set_groundtruth(ground_truth, 'decision')
+        self.set_groundtruth(ground_truth)
 
         self.speed_obs = speed_obs
         self.space_obs = space_obs
+        self.gt        = ground_truth
 
         return trial
 
@@ -220,13 +218,109 @@ class AverageDirectionTest(ngym.TrialEnv):
         for i in range(len(self.space_obs)):
             self.space_obs[i] += self.speed_obs[i]
 
-        return self.space_obs, reward, done, {'new_trial': new_trial, 'gt': gt}
+        self.gt = gt > 0
+        return self.space_obs, reward, done, {'new_trial': done, 'gt': gt}
 
 
 class DawTwoStep(ngym.TrialEnv):
-    """On each trial, an initial choice between two options lead to either of two, second-stage states. 
-    In turn, these both demand another two-option choice, each of which is associated with a different chance of receiving reward.
+    """Daw Two-step task.
 
-    https://neurogym.github.io/envs/DawTwoStep-v0.html"""
+    On each trial, an initial choice between two options lead
+    to either of two, second-stage states. In turn, these both
+    demand another two-option choice, each of which is associated
+    with a different chance of receiving reward.
+    """
+    metadata = {
+        'paper_link': 'https://www.sciencedirect.com/science/article/' +
+        'pii/S0896627311001255',
+        'paper_name': 'Model-Based Influences on Humans' +
+        ' Choices and Striatal Prediction Errors',
+        'tags': ['two-alternative']
+    }
 
-    pass
+    def __init__(self, dt=100, rewards=None, timing=None):
+        super().__init__(dt=dt)
+        if timing is not None:
+            print('Warning: Two-step task does not require timing variable.')
+        # Actions ('FIXATE', 'ACTION1', 'ACTION2')
+        self.actions = [0, 1, 2]
+
+        # trial conditions
+        self.p1 = 0.8  # prob of transitioning to state1 with action1 (>=05)
+        self.p2 = 0.8  # prob of transitioning to state2 with action2 (>=05)
+        self.p_switch = 0.025  # switch reward contingency
+        self.high_reward_p = 0.9
+        self.low_reward_p = 0.1
+        self.tmax = 3*self.dt
+        self.mean_trial_duration = self.tmax
+        self.state1_high_reward = True
+        # Rewards
+        self.rewards = {'abort': -0.1, 'correct': +1.}
+        if rewards:
+            self.rewards.update(rewards)
+
+        self.action_space = ngym.spaces.Discrete(3)
+        self.observation_space = ngym.spaces.Box(-np.inf, np.inf, shape=(3,),
+                                            dtype=np.float32)
+
+    def _new_trial(self, **kwargs):
+        # ---------------------------------------------------------------------
+        # Trial
+        # ---------------------------------------------------------------------
+        # determine the transitions
+        transition = np.empty((3,))
+        st1 = 1
+        st2 = 2
+        tmp1 = st1 if self.rng.rand() < self.p1 else st2
+        tmp2 = st2 if self.rng.rand() < self.p2 else st1
+        transition[self.actions[1]] = tmp1
+        transition[self.actions[2]] = tmp2
+
+        # swtich reward contingency
+        switch = self.rng.rand() < self.p_switch
+        if switch:
+            self.state1_high_reward = not self.state1_high_reward
+        # which state to reward with more probability
+        if self.state1_high_reward:
+            hi_state, low_state = 0, 1
+        else:
+            hi_state, low_state = 1, 0
+
+        reward = np.empty((2,))
+        reward[hi_state] = (self.rng.rand() <
+                            self.high_reward_p) * self.rewards['correct']
+        reward[low_state] = (self.rng.rand() <
+                             self.low_reward_p) * self.rewards['correct']
+        self.ground_truth = hi_state+1  # assuming p1, p2 >= 0.5
+        trial = {
+            'transition':  transition,
+            'reward': reward,
+            'hi_state': hi_state,
+            }
+
+        return trial
+
+    def _step(self, action):
+        trial = self.trial
+        info = {'new_trial': False}
+        reward = 0
+
+        ob = np.zeros((3,))
+        if self.t == 0:  # at stage 1, if action==fixate, abort
+            if action == 0:
+                reward = self.rewards['abort']
+                info['new_trial'] = True
+            else:
+                state = trial['transition'][action]
+                ob[int(state)] = 1
+                reward = trial['reward'][int(state-1)]
+                self.performance = action == self.ground_truth
+        elif self.t == self.dt:
+            ob[0] = 1
+            if action != 0:
+                reward = self.rewards['abort']
+            info['new_trial'] = True
+        else:
+            raise ValueError('t is not 0 or 1')
+
+        return ob, reward, False, info
